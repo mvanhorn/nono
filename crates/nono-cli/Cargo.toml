@@ -114,7 +114,3 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "tool_sandbox_invoke"
-harness = false
