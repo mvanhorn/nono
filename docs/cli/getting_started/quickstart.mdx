@@ -12,7 +12,7 @@ nono run --allow . -- <COMMAND> [ARGS...]
 ```
 
 <Note>
-The `--` separator is recommended. Everything after it is the command to run.
+The `--` separator is used for visual clarity, to help the reader distinguish between nono flags and the command being run. It's not strictly required if there are no flag conflicts, but we recommend using it consistently to avoid ambiguity.
 </Note>
 
 ```bash
@@ -103,9 +103,9 @@ nono shell --allow-cwd --shell /bin/zsh
 
 Exit the shell with `Ctrl-D` or `exit`.
 
-## Checking Path Access (`nono why`)
+## Checking Policy Access (`nono why`)
 
-The `why` command checks if a path or network operation would be allowed or denied. It's designed for both human debugging and programmatic use by AI agents.
+The `why` command checks if a filesystem path, network operation, kernel scope, or ETI command invocation would be allowed or denied. It's designed for both human debugging and programmatic use by AI agents.
 
 ```bash
 # Check if a sensitive path would be blocked
@@ -120,12 +120,18 @@ nono why --path ./src --op write --allow .
 nono why --json --path ~/.aws --op read
 # {"status":"denied","reason":"sensitive_path","category":"AWS credentials",...}
 
+# Check an ETI command/argv policy denial
+nono why --profile gh --command gh -- issue comment 1052
+# Output: DENIED - agents may read issues but not comment on them
+
 # From inside a sandbox, query own capabilities
 nono run --allow-cwd -- nono why --self --path /tmp --op write --json
 ```
 
 | Flag | Description |
 |------|-------------|
+| `--command` | Tool-sandbox command name to check |
+| `--caller` | Command-policy caller edge (default: `session`) |
 | `--path` | Filesystem path to check |
 | `--op` | Operation: `read`, `write`, or `readwrite` (default: `read`) |
 | `--host` | Network host to check (instead of `--path`) |
