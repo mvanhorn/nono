@@ -3112,6 +3112,12 @@ fn apply_outer_exec_gate(
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::Refer)
+        .map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot handle Landlock Refer: {err}"
+            ))
+        })?
         .create()
         .map_err(|err| {
             NonoError::SandboxInit(format!(
@@ -3150,6 +3156,21 @@ fn apply_outer_exec_gate(
                 NonoError::SandboxInit(format!(
                     "tool-sandbox outer exec gate add_rule for {}: {err}",
                     dir.display()
+                ))
+            })?;
+    }
+
+    if abi.has_refer() {
+        let root_fd = PathFd::new("/").map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot open / for Refer grant: {err}"
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
+            .map_err(|err| {
+                NonoError::SandboxInit(format!(
+                    "tool-sandbox outer exec gate add_rule for / (Refer): {err}"
                 ))
             })?;
     }

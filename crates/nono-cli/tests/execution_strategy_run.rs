@@ -299,6 +299,35 @@ fn command_policies_allows_compiled_binary_exec_in_writable_grant_dir() {
         .assert_stdout_contains("ok");
 }
 
+/// An active `command_policies` outer exec gate must preserve Landlock REFER
+/// so a writable workspace grant can rename files across child directories.
+#[test]
+#[cfg(target_os = "linux")]
+fn command_policies_preserves_rename_across_workspace_directories() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+
+    let t = nono_test!("cmd-policies-rename");
+    let profile = command_policies_profile(&t, "cmd-policies-rename");
+
+    t.run()
+        .profile(&profile)
+        .no_rollback()
+        .exec(Argv::new("python3").arg("-c").arg(
+            "import os, pathlib; pending = pathlib.Path('pending'); pending.mkdir(); \
+             source = pending / 'result.json'; source.write_text('{\"ok\":true}\\n'); \
+             os.rename(source, 'result.json')",
+        ))
+        .assert_success("command_policies preserves rename from a child directory to its parent");
+
+    assert!(
+        t.workspace().join("result.json").exists(),
+        "renamed destination must exist in the workspace root"
+    );
+}
+
 /// Workspace-only profile with an active `command_policies` outer exec gate.
 #[cfg(target_os = "linux")]
 fn command_policies_profile(t: &NonoTest, name: &str) -> Profile {
