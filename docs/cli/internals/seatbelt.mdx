@@ -170,6 +170,14 @@ To block Unix socket connections, nono emits an additional rule alongside the st
 
 Seatbelt evaluates these rules at `connect(2)` time, so they also block connections to sockets created after the sandbox initializes. Non-existent deny targets use the fail-secure recursive form because they may later become directories.
 
+A directory `(deny network-outbound (subpath …))` is a network rule, so it is emitted after the socket allow from the grant and wins. Pairing that socket grant with `filesystem.bypass_protection` appends a narrower network exception after the deny: a `path` allow and a `remote unix-socket` literal allow for the granted socket. When the granted path is a symlink inside the denied directory, as with Docker Desktop's `~/.docker/run/docker.sock`, those rules name the pre-resolution path passed to `connect(2)`. The canonical target is named only when the socket grant covers that target. A sibling socket stays denied. A bypass of the denied directory itself, paired with a subtree grant of that directory, is what emits a `subpath` allow; a bypass of one socket does not.
+
+```scheme
+(deny network-outbound (subpath "/Users/example/.docker"))
+(allow network-outbound (path "/Users/example/.docker/run/docker.sock"))
+(allow network-outbound (remote unix-socket (literal "/Users/example/.docker/run/docker.sock")))
+```
+
 ### Granular Filtering Limitations
 
 Seatbelt supports filtering by protocol (TCP/UDP), direction (inbound/outbound), and even IP address via `remote ip` filters. However, it does **not** provide per-hostname or per-domain filtering. Since DNS resolution happens before the connection, filtering by domain would require:

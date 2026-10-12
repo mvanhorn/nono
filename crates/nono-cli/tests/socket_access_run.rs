@@ -316,6 +316,72 @@ fn filesystem_directory_bypass_preserves_unix_socket_scope_on_macos() {
         .assert_failure("exact bypass does not widen to a sibling socket");
 }
 
+/// A symlink socket whose target sits outside a denied parent is still named
+/// by the path under that parent. `unix_socket_subtree` of the symlink's
+/// directory plus a bypass of the symlink itself must reopen that path only.
+#[test]
+#[cfg(target_os = "macos")]
+fn filesystem_directory_deny_allows_symlink_socket_bypass_on_macos() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+
+    let t = nono_test!("macos-socket-symlink-bypass");
+    let sock_tmp = short_tempdir();
+    let parent = sock_tmp.path().join("parent");
+    let run_dir = parent.join("run");
+    let outside = sock_tmp.path().join("outside");
+    std::fs::create_dir_all(&run_dir).expect("create run directory");
+    std::fs::create_dir_all(&outside).expect("create outside directory");
+    let outside_path = outside.join("real.sock");
+    let symlink_path = run_dir.join("docker.sock");
+    let sibling_path = run_dir.join("sibling.sock");
+    let _outside_listener = UnixListener::bind(&outside_path).expect("bind outside socket");
+    let _sibling_listener = UnixListener::bind(&sibling_path).expect("bind sibling socket");
+    std::os::unix::fs::symlink(&outside_path, &symlink_path).expect("symlink socket");
+
+    let denied_dir = parent.to_string_lossy().into_owned();
+    let run_arg = run_dir.to_string_lossy().into_owned();
+    let symlink_arg = symlink_path.to_string_lossy().into_owned();
+    let sibling_arg = sibling_path.to_string_lossy().into_owned();
+    let profile_without_bypass = t.write_profile(
+        "macos-socket-symlink-no-bypass",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-symlink-no-bypass"}},"workdir":{{"access":"readwrite"}},"network":{{"block":true}},"filesystem":{{"deny":["{denied_dir}"],"unix_socket_subtree":["{run_arg}"]}}}}"#
+        ),
+    );
+    let profile = t.write_profile(
+        "macos-socket-symlink-bypass",
+        &format!(
+            r#"{{"meta":{{"name":"macos-socket-symlink-bypass"}},"workdir":{{"access":"readwrite"}},"network":{{"block":true}},"filesystem":{{"deny":["{denied_dir}"],"unix_socket_subtree":["{run_arg}"],"bypass_protection":["{symlink_arg}"]}}}}"#
+        ),
+    );
+    let connect = |path: &str| {
+        format!(
+            "import socket; s=socket.socket(socket.AF_UNIX); s.connect({path:?}); print('connected')"
+        )
+    };
+
+    t.run()
+        .profile(&profile_without_bypass)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&symlink_arg)))
+        .assert_failure("symlink socket grant without a bypass remains blocked")
+        .assert_stdout_lacks("connected");
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&symlink_arg)))
+        .assert_success("bypassed symlink socket below a denied directory is allowed")
+        .assert_stdout_contains("connected");
+
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(connect(&sibling_arg)))
+        .assert_failure("sibling socket below the denied directory remains blocked")
+        .assert_stdout_lacks("connected");
+}
+
 /// Yama `ptrace_scope`, or `None` if it can't be read (non-Yama kernel).
 #[cfg(target_os = "linux")]
 fn yama_ptrace_scope() -> Option<i32> {

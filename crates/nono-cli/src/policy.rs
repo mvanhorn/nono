@@ -1686,7 +1686,7 @@ fn emit_macos_socket_bypass_rules(
 
     let socket_caps = caps.unix_socket_capabilities().to_vec();
     for cap in socket_caps.iter().filter(|cap| cap.source.is_user_intent()) {
-        let Some((filter, mut paths)) =
+        let Some((filter_kind, mut paths)) =
             socket_bypass_intersection(cap, canonical, expanded, is_file)
         else {
             continue;
@@ -1696,7 +1696,7 @@ fn emit_macos_socket_bypass_rules(
 
         for path in paths {
             let path = path_to_utf8(&path)?;
-            let filter = match filter {
+            let filter = match filter_kind {
                 Filter::Path => format!("path \"{}\"", escape_seatbelt_path(path)?),
                 Filter::Children => {
                     format!("regex #\"^{}/[^/]+$\"", escape_seatbelt_regex_path(path)?)
@@ -1704,6 +1704,16 @@ fn emit_macos_socket_bypass_rules(
                 Filter::Subtree => format!("subpath \"{}\"", escape_seatbelt_path(path)?),
             };
             caps.add_platform_rule(format!("(allow network-outbound ({}))", filter))?;
+            // File-scoped exceptions also name this same escaped path as the
+            // sockaddr passed to connect(2). The canonical vnode is included
+            // only when the socket grant covers that target.
+            if matches!(filter_kind, Filter::Path) {
+                let escaped = escape_seatbelt_path(path)?;
+                caps.add_platform_rule(format!(
+                    "(allow network-outbound (remote unix-socket (literal \"{}\")))",
+                    escaped
+                ))?;
+            }
             if cap.mode.permits_bind() {
                 caps.add_platform_rule(format!("(allow network-bind ({}))", filter))?;
             }
@@ -1716,33 +1726,79 @@ fn emit_macos_socket_bypass_rules(
         expanded: &Path,
         is_file: bool,
     ) -> Option<(Filter, Vec<PathBuf>)> {
+        let form_covers = |base: &Path, candidate: &Path| match cap.scope {
+            SocketScope::File => candidate == base,
+            SocketScope::DirChildren => candidate.parent() == Some(base),
+            SocketScope::DirSubtree => candidate != base && candidate.starts_with(base),
+        };
+        let covered = |candidate: &Path| {
+            form_covers(&cap.original, candidate) || form_covers(&cap.resolved, candidate)
+        };
+
         if is_file {
-            return cap.covers(canonical).then(|| {
-                (
-                    Filter::Path,
-                    vec![canonical.to_path_buf(), expanded.to_path_buf()],
-                )
-            });
+            let mut paths = Vec::new();
+            let covers_named = covered(expanded);
+            let covers_canonical = covered(canonical);
+            // The sockaddr passed to connect(2). A grant that covers only the
+            // canonical target still names this expanded path, so the previous
+            // dual-path exception stays in place.
+            if covers_named || covers_canonical {
+                paths.push(expanded.to_path_buf());
+            }
+            // The vnode path, only when the socket grant covers that target.
+            // Coverage of the symlink does not cover a target outside the grant.
+            if covers_canonical {
+                paths.push(canonical.to_path_buf());
+            }
+            if paths.is_empty() {
+                return None;
+            }
+            return Some((Filter::Path, paths));
         }
 
+        let under_bypass = |path: &Path| path.starts_with(canonical) || path.starts_with(expanded);
+        // `resolved` left the denied tree when the socket is a symlink. Keep
+        // the pre-resolution path, which is the one still under the bypass.
+        let grant_rooted = |scope_filter: Filter| {
+            if under_bypass(&cap.resolved) {
+                Some((
+                    scope_filter,
+                    vec![cap.resolved.clone(), cap.original.clone()],
+                ))
+            } else if under_bypass(&cap.original) {
+                Some((scope_filter, vec![cap.original.clone()]))
+            } else {
+                None
+            }
+        };
+
         match cap.scope {
-            SocketScope::File if cap.resolved.starts_with(canonical) => Some((
-                Filter::Path,
-                vec![cap.resolved.clone(), cap.original.clone()],
-            )),
-            SocketScope::DirChildren if cap.resolved.starts_with(canonical) => Some((
-                Filter::Children,
-                vec![cap.resolved.clone(), cap.original.clone()],
-            )),
-            SocketScope::DirSubtree if cap.resolved.starts_with(canonical) => Some((
-                Filter::Subtree,
-                vec![cap.resolved.clone(), cap.original.clone()],
-            )),
-            SocketScope::DirSubtree if canonical.starts_with(&cap.resolved) => Some((
-                Filter::Subtree,
-                vec![canonical.to_path_buf(), expanded.to_path_buf()],
-            )),
-            _ => None,
+            SocketScope::File => grant_rooted(Filter::Path),
+            SocketScope::DirChildren => grant_rooted(Filter::Children),
+            SocketScope::DirSubtree
+                if under_bypass(&cap.resolved) || under_bypass(&cap.original) =>
+            {
+                grant_rooted(Filter::Subtree)
+            }
+            SocketScope::DirSubtree => {
+                let inside_grant = |candidate: &Path| {
+                    candidate.starts_with(&cap.resolved) || candidate.starts_with(&cap.original)
+                };
+                if inside_grant(canonical) {
+                    // The grant covers this directory, so keep both path forms.
+                    Some((
+                        Filter::Subtree,
+                        vec![canonical.to_path_buf(), expanded.to_path_buf()],
+                    ))
+                } else if inside_grant(expanded) {
+                    // Only the expanded path sits inside the subtree grant. A
+                    // subpath rooted at the canonical target would reopen that
+                    // outside directory tree.
+                    Some((Filter::Subtree, vec![expanded.to_path_buf()]))
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -1829,6 +1885,36 @@ pub fn apply_deny_overrides(
                         grant_has_write = true;
                     }
                 }
+            }
+        }
+        // A socket grant covers the bypass when either the path the caller
+        // named or its canonical target matches the grant's original or
+        // resolved form. A subtree of `~/.docker/run` therefore covers
+        // `~/.docker/run/docker.sock` even though that symlink's target sits
+        // outside the directory, and it does not cover the parent `~/.docker`.
+        #[cfg(target_os = "macos")]
+        for cap in caps.unix_socket_capabilities() {
+            if !cap.source.is_user_intent() {
+                continue;
+            }
+            let form_covers = |base: &Path, candidate: &Path| match cap.scope {
+                SocketScope::File => candidate == base,
+                SocketScope::DirChildren => candidate.parent() == Some(base),
+                SocketScope::DirSubtree => candidate != base && candidate.starts_with(base),
+            };
+            let covered = [&expanded, &canonical].into_iter().any(|candidate| {
+                form_covers(&cap.original, candidate) || form_covers(&cap.resolved, candidate)
+            });
+            if !covered {
+                continue;
+            }
+            // Connect reopens read. Connect+bind reopens read and write.
+            // File allows below use the existing literal-versus-subpath choice.
+            if cap.mode.permits_bind() {
+                grant_has_read = true;
+                grant_has_write = true;
+            } else {
+                grant_has_read = true;
             }
         }
         if !grant_has_read && !grant_has_write {
@@ -4013,6 +4099,114 @@ mod tests {
             caps.platform_rules().iter().any(|rule| rule == &expected),
             "socket bypass must emit an exact network exception: {:?}",
             caps.platform_rules()
+        );
+    }
+
+    /// Docker Desktop's socket is a symlink inside a denied directory whose
+    /// canonical target lives outside that directory. A subtree grant of the
+    /// symlink's parent must reopen only the symlink path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_deny_overrides_reopens_symlink_socket_outside_deny() {
+        let root = tempfile::Builder::new()
+            .prefix("nono-bypass-link-")
+            .tempdir_in("/tmp")
+            .expect("tempdir in /tmp");
+        let parent = root.path().join("parent");
+        let run_dir = parent.join("run");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&run_dir).expect("mkdir run");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        let outside_sock = outside.join("real.sock");
+        let symlink = run_dir.join("docker.sock");
+        let sibling = run_dir.join("sibling.sock");
+        let _outside_listener =
+            std::os::unix::net::UnixListener::bind(&outside_sock).expect("bind outside socket");
+        let _sibling_listener =
+            std::os::unix::net::UnixListener::bind(&sibling).expect("bind sibling socket");
+        std::os::unix::fs::symlink(&outside_sock, &symlink).expect("symlink socket");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability::new_dir(&run_dir, AccessMode::Read).expect("grant run"));
+        caps.add_unix_socket(
+            nono::UnixSocketCapability::new_dir_subtree(&run_dir, nono::UnixSocketMode::Connect)
+                .expect("grant subtree"),
+        );
+
+        let mut parent_deny = vec![parent.clone()];
+        let parent_err = apply_deny_overrides(
+            std::slice::from_ref(&parent),
+            &mut parent_deny,
+            &mut caps.clone(),
+        );
+        let parent_err = parent_err.expect_err("parent bypass must fail closed");
+        assert!(
+            parent_err.to_string().contains("no matching grant"),
+            "child subtree grant must not authorize the parent, got: {parent_err}"
+        );
+
+        let mut deny_paths = Vec::new();
+        add_deny_access_rules(
+            parent.to_str().expect("utf8 parent"),
+            &mut caps,
+            &mut deny_paths,
+        )
+        .expect("deny parent");
+        apply_deny_overrides(std::slice::from_ref(&symlink), &mut deny_paths, &mut caps)
+            .expect("symlink bypass");
+
+        let symlink_display = symlink.display().to_string();
+        let outside_display = outside_sock
+            .canonicalize()
+            .expect("canonicalize outside")
+            .display()
+            .to_string();
+        let path_allow = format!("(allow network-outbound (path \"{symlink_display}\"))");
+        let literal_allow = format!(
+            "(allow network-outbound (remote unix-socket (literal \"{symlink_display}\")))"
+        );
+        let rules = caps.platform_rules();
+        let last_deny = rules
+            .iter()
+            .rposition(|rule| rule.contains("(deny network-outbound"))
+            .expect("directory network deny");
+        let path_at = rules
+            .iter()
+            .position(|rule| rule == &path_allow)
+            .expect("path allow");
+        let literal_at = rules
+            .iter()
+            .position(|rule| rule == &literal_allow)
+            .expect("unix-socket literal allow");
+        assert!(
+            last_deny < path_at && last_deny < literal_at,
+            "socket allows must follow the directory deny: {rules:?}"
+        );
+        assert!(
+            rules.iter().all(|rule| {
+                !rule.contains("network-outbound") || !rule.contains(&outside_display)
+            }),
+            "canonical target stays denied when the subtree grant does not cover it: {rules:?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| !rule.contains(&sibling.display().to_string())),
+            "sibling socket must stay denied: {rules:?}"
+        );
+        assert!(
+            rules.iter().all(|rule| !rule.contains("network-bind")),
+            "connect grant must not emit network-bind: {rules:?}"
+        );
+        assert!(
+            rules.iter().all(|rule| !rule.contains("(allow file-write")),
+            "connect grant must not emit file-write: {rules:?}"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| !rule.contains("(allow network-outbound (subpath")),
+            "must not emit a subpath network allow: {rules:?}"
         );
     }
 
